@@ -14,102 +14,11 @@ import shapely, descartes
 from descartes.patch import PolygonPatch
 from shapely.geometry import Polygon, MultiPoint, Point
 
+from xtb_binding import estimate_dG_xtb
 
 
 #----parameter & preparation
-def dok2pdb(rdid, reconstructing_pdbtarget, n=0, base_path="outputs/"):
-    """
-    PRE: TAKES in a rdid with a corresponding mol2 and dok file for the guest
-    POST: Will produce the n best complexes that correspond to the docking in pdb and mol2 formats
-    """
-	
-    # ERASE OLD AND SPLITS IN INDIVIDUAL PDB FILES
-    for f in glob.glob("{}{}-{}.pdb".format(base_path, rdid,"*")):
-         with open(f, 'w') as w: pass
-	
-    i=0
-    #SPLITS THE DOK INTO INDIVIDUAL PDBs
-    guest_list = []
-    #try:
-    with open("{}{}.dok".format(base_path, rdid), 'r') as r:
-        for line in r:
-            if i>n: break
-            curcomplex = "{}{}-{}.pdb".format(base_path, rdid, i)
-            with open(curcomplex, "a") as a:
-                #a.write(line)
-                if "ATOM" in line:
-                    pts = line.strip().split()
-                    # EXAMPLE:  ATOM      2  C1  LIG     0      -6.550  -3.810  -2.641
-                    rec_line = ("{0}{1: >7}  {2: <4}{3}     {4}{5: >12}{6: >8}{7: >8}\n".format(pts[0], pts[1], pts[2], pts[3], pts[4], pts[5], pts[6], pts[7]))
-                    #print rec_line
-                else:
-                    rec_line = line
-                a.write(rec_line)
-            if "END" in line:
-                guest_list.append(curcomplex)
-                i=i+1
-	
-    # CREATES THE COMPLEXES
-    cb = Chem.MolFromPDBFile(reconstructing_pdbtarget, removeHs=False) #HETATM tags rather than ATOM are needed for safe reading
-    complex_list = []
-    for f in sorted(glob.glob("{}{}-{}.pdb".format(base_path, rdid, "*"))):
-        print(f)
-        try:
-            guest = Chem.MolFromPDBFile(f, removeHs=False)
-            cbguest = Chem.CombineMols(cb, guest)
-            complex_pdb_fname = f.replace(rdid, rdid+'-CB')
-            Chem.MolToPDBFile(cbguest, complex_pdb_fname)
-            complex_list.append(complex_pdb_fname)
-        except:
-            print("Complex reassembling failed")
-    return 
 
-def make_docking_script(rdid, docking_targetPDB):
-    """
-
-    Parameters
-    ----------
-    docking_targetPDB : a pdb file that is the docking target for the docking procedure
-        DESCRIPTION.
-    rdid: A random string that defines the molecule and upon which later names will be based on 
-
-    Returns
-    -------
-    None.
-    """
-    docking_script="""
-Receptor
-{0}
-RMSD
-1.0
-Binding pocket
--20 20
--20 20
--20 20
-Number of binding poses
-20
-Ligands list
-outputs/{1}-ligands.list
-    """.format(docking_targetPDB, rdid)
-	
-    with open("outputs/{}-ledock.config".format(rdid), "w") as w:
-        w.write(docking_script)
-    with open("outputs/{}-ligands.list".format(rdid), "w") as w:
-        w.write("outputs/{}.mol2".format(rdid))
-    return 
-
-def tar_it_all(rdid):
-    """
-    rdid : a molecule id value
-    will tar all related files to outputs/rdid-ALL-SAVED.tar
-    """
-    os.chdir("outputs")
-    with tarfile.open("{}-ALL-SAVED.tar".format(rdid), "w:gz") as tar:
-        for el in list(set(glob.glob("{}*".format(rdid)))-set(glob.glob("*tar"))):
-            tar.add(el)
-            os.remove(el)
-    os.chdir("..")
-    return 
 
 def find_best_fitting_plane(XYZ):
     """
@@ -125,7 +34,7 @@ def find_best_fitting_plane(XYZ):
     """
     # Inital guess of the plane, the plane should be close to perpendicular to x and pass near 3 Angstrom positive
     XYZ
-    p0 = [1, 0, 0, -3]
+    p0 = [0, 0, 1, -3]
     
     def f_min(X,p):
         plane_xyz = p[0:3]
@@ -143,7 +52,8 @@ def find_best_fitting_plane(XYZ):
 #     print("Old Error: ", (f_min(XYZ, p0)**2).sum())
 #     print("New Error: ", (f_min(XYZ, sol)**2).sum())
 # =============================================================================
-    return sol/sol[0]
+
+    return sol/sum([x**2 for x in sol[:3]])**.5 # this effectively returns a normed normal 
 
 def project_xyz_in_plane(xyz, plane_vec):
     """
@@ -203,13 +113,24 @@ def get_coverage_score(rdid, base_path="outputs/"):
     the coverage number defined as the percentage of occulted portal. That is total area covered by cap atoms divided by portal surface
     """
     # Loads the complex molecule
-    capped_complex = Chem.MolFromPDBFile("{}{}-CB-0.pdb".format(base_path, rdid), removeHs=False)
+    capped_complex = Chem.MolFromPDBFile("{}{}-CB-0.xtbopt.pdb".format(base_path, rdid), removeHs=False)
     components = Chem.GetMolFrags(capped_complex, asMols=True) # By default we will get them in the order of appearance in the pdb file, so CB, ADA, CAP
-    O_upper_portal_coords = np.array([xyz for sym, xyz in zip([at.GetSymbol() for at in components[0].GetAtoms()], components[0].GetConformer(0).GetPositions()) if (sym=="O" and xyz[0]>0)]).T # get the xyz of the upper portal O
+    if len(components)!=3: raise Exception("Not Three components")
+
+
+    O_upper_portal_coords = np.array([xyz for sym, xyz in zip([at.GetSymbol() for at in components[0].GetAtoms()], components[0].GetConformer(0).GetPositions()) if (sym=="O" and xyz[2]>0)]).T # get the xyz of the upper portal O
+
+
     cap_coords = components[2].GetConformer(0).GetPositions().T # get the cap coordinates
+
+
     portal_plane = find_best_fitting_plane(np.array(O_upper_portal_coords)) # finds the best fitting plane for the portal, should be close to (1,0,0,-3)
-    
+
+
+
     O_upper_portal_on_plane = project_xyz_in_plane(O_upper_portal_coords,portal_plane) # Get the projection of O coordinates in the new plane
+
+
     cap_atoms_projected_on_plane = project_xyz_in_plane(cap_coords,portal_plane) # Get the projection of caps atoms on the portal plane
     
     xy_only_portal_points = translate_rotate_points_to_XY_plane(O_upper_portal_on_plane, portal_plane) # rotate translate portal planes to eliminate z contribution
@@ -233,8 +154,8 @@ def get_coverage_score(rdid, base_path="outputs/"):
         else:
             out = out.union(a.buffer(1.3))    
     portal_fraction_occluded = portal_polygon.intersection(occluded.union(out))
-    
 # =============================================================================
+#     
 #     # VISULALIZE  THE AREAS
 #     fig = plt.figure(1, dpi=90)
 #     ax = fig.add_subplot(111)
@@ -243,6 +164,8 @@ def get_coverage_score(rdid, base_path="outputs/"):
 #     ax.add_patch(PolygonPatch(out, alpha=0.1, zorder=2)) # ATOMS OUT ABOVE THE PORTAL
 #     ax.add_patch(PolygonPatch(portal_fraction_occluded, alpha=0.5, zorder=2)) # PORTAL intersection ATOMS ABOVE
 #     plt.show()
+# =============================================================================
+# =============================================================================
 #     
 #     # PLOTTING TESTS 
 #     fig = plt.figure()
@@ -263,57 +186,56 @@ def get_coverage_score(rdid, base_path="outputs/"):
     
     # Find portal surface and plane
     return portal_fraction_occluded.area/portal_area
-    
+   
+		
+def tar_it_all(rdid, keep=True):
+    """
+    rdid : a molecule id value
+    will tar all related files to outputs/rdid-ALL-SAVED.tar
+    """
+    os.chdir("outputs")
+    GauNums = []
+    for logs in glob.glob("{}*.log".format(rdid)): # DITCH THE GAU TMP FILES
+        with open(logs,"r") as r:
+            for line in r:
+                if "PID" in line:
+                    GauNums.append(line.split()[-1][:-1])
+                    break
+    for nums in GauNums:
+        for Gau in glob.glob("Gau-{}.*".format(nums)):
+            os.remove(Gau)
+
+    with tarfile.open("{}-ALL-SAVED.tar".format(rdid), "w:gz") as tar:
+        for el in list(set(glob.glob("{}*".format(rdid)))-set(glob.glob("*tar"))):
+            tar.add(el)
+            os.remove(el)
+    if not keep:
+        os.remove("{}-ALL-SAVED.tar".format(rdid))
+    for core in glob.glob("core.*"): # DITCH THE CORES THAT POP UP 
+        os.remove(core)
+
+    os.chdir("..")
+    return 
+
 def rdock_score(compound, docking_target="adamantanone-docked-named-c.pdb"):
 
     input_smiles = str(compound)
     #num_docking = 3 # number of docking trials/ not an option here, hardcoded in the config file
 	
-    rdstring = ''.join([random.choice(string.ascii_letters + string.digits) for n in xrange(32)])
-    mol2_file = 'outputs/{}.mol2'.format(rdstring)
-    sdf_file = 'outputs/{}.sdf'.format(rdstring)
     min_score = 10**10
-
-    #----Translation from SMILES to sdf
-    fw = Chem.SDWriter(sdf_file)
     m1 = Chem.MolFromSmiles(input_smiles)
+    rdstring = ''.join([random.choice(string.ascii_letters + string.digits) for n in xrange(32)])
     try:
         if m1!= None:
-            m = Chem.AddHs(m1)
 
-            cid = AllChem.EmbedMolecule(m)
-            #fw.write(m)
-
-            opt = AllChem.MMFFOptimizeMolecule(m,maxIters=2000)
-            print(opt)
-
-            fw.write(m)
-            fw.close()
-            
-            #----convert to mol2
-            convert_cmd = "obabel {} -O {}".format(sdf_file, mol2_file)
-            proc = subprocess.call(convert_cmd.split() , shell=False)
-            
-            #----rdock calculation
-            make_docking_script(rdstring, docking_target)
-            cmd = "./ledock_linux_x86 outputs/{0}-ledock.config > outputs/{0}.log".format(rdstring)
-            proc = subprocess.check_output(cmd.split() , shell=False )
-            #proc = subprocess.call(cmd.split() , shell=False )
-            #proc = subprocess.call(cmd , shell=True )
-            
-            dok2pdb(rdstring, docking_target, n=0)
+            #----ledock docking and  calculation
+            rdstring, dG, _ = estimate_dG_xtb(input_smiles, NAME=rdstring) # rdstring is the base name and dG is the binding energy in kcal/mol; more positive is worse binding
             
             #----find the percentage of portal occluded
             percent_portal_covered = get_coverage_score(rdstring)
+                 
             
-            
-            #----find the minimum score of rdock from multiple docking results
-            with open("outputs/{}.dok".format(rdstring), "r") as r:
-                lines = r.readlines()
-            
-
-
-            min_score = float(lines[1].split()[-2])
+            min_score = float(dG)
 
 
 
@@ -323,12 +245,16 @@ def rdock_score(compound, docking_target="adamantanone-docked-named-c.pdb"):
 #             with open("outputs/{}-RES".format(rdstring), "w") as w:
 #                 w.write("{}\t{}\t{}\n".format(rdstring, compound, min_score))
 # =============================================================================
-				
-            tar_it_all(rdstring)
+#            if min_score > 0 and min_score < 50:
+#                tar_it_all(rdstring, keep=False)
+#            else:
+#                tar_it_all(rdstring, keep=True)
+            tar_it_all(rdstring, keep=True)
     except:
         print(traceback.format_exc())
         min_score=10**10
         percent_portal_covered=0
+#        tar_it_all(rdstring, keep=True)
 
 
 
@@ -344,6 +270,9 @@ if __name__=="__main__":
 # 
 # =============================================================================
 
-   # get_coverage_score("2BlgxNRGF5ko9PoiYXYO1VQCV4mUfgZw", base_path="/home/macenrola/Documents/ML/ChemTS/ledock_ligand_design_with_sa_scorer_adaincl_good_save/outputs/")
-
+    #print get_coverage_score("8AP0Gu0s998VtiBboEiRD3bC0IyHsw9x", base_path="/home/macenrola/Documents/ML/ChemTS/ledock_ligand_design_with_SMALL_MOLS_NEW_SCORING_RST_XTB/outputs/")
+    #rdock_score("c1ccccc1")
+    with open("triiodo-tests.smi","r") as r:
+        for line in r:
+            print rdock_score(line.split()[0])
     pass
